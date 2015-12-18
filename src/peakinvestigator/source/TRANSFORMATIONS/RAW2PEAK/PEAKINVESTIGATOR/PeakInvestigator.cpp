@@ -52,8 +52,14 @@
 #include <QtCore/QTextStream>
 #include <QtCore/QtDebug>
 
-#define VI_API_SUFFIX "/interface/API.php"
+// JSON support
+#include <QJson>
+
+#define VI_API_SUFFIX "/api/"
 #define VI_SSH_HASH String("7E:6D:03:89:68:38:0B:9F:C7:E5:13:26:56:46:08:FF")
+#define reqVeritomyxCLIVersion "2.12"
+#define minutesCheckPrep 2
+#define minutesTimeoutPrep 20
 
 using namespace std;
 
@@ -65,7 +71,7 @@ namespace OpenMS
     ProgressLogger()
   {
     // set default parameter values
-    defaults_.setValue("server", "secure.veritomyx.com", "Server address for PeakInvestigator (without https://)");
+    defaults_.setValue("server", "peakinvestigator.veritomyx.com", "Server address for PeakInvestigator (without https://)");
     defaults_.setValue("username", "USERNAME", "Username for account registered with Veritomyx");
     defaults_.setValue("password", "PASSWORD", "Password for account registered with Veritomyx");
     defaults_.setValue("account", "0", "Account number");
@@ -100,7 +106,7 @@ namespace OpenMS
       // Generate local and remote filenames of tar'd scans
       zipfilename = job_ + ".scans.tar";
       localFilename = QDir::tempPath() + "/" + zipfilename;
-      remoteFilename = "accounts/" + account_number_.toQString() + "/batches/" + zipfilename;
+      remoteFilename = sftp_dir_ + "/" + zipfilename;
       tar.store(localFilename, experiment_);
 
       // Remove data values from scans in exp now that they have been bundled
@@ -109,18 +115,25 @@ namespace OpenMS
         experiment_[i].clear(false);
       }
 
-      // Set SFTP host paramters and upload file
-      sftp.setHostname(server_);
-      sftp.setUsername(sftp_username_);
-      sftp.setPassword(sftp_password_);
-      sftp.setExpectedServerHash(VI_SSH_HASH);
+      if(getSFTPCredentials()) {
 
-      if(sftp.uploadFile(localFilename, remoteFilename) && submitJob_())
-      {
-        experiment_.setMetaValue("veritomyx:server", server_);
-        experiment_.setMetaValue("veritomyx:job", job_);
-        experiment_.setMetaValue("veritomyx:sftp_username", sftp_username_);
-        experiment_.setMetaValue("veritomyx:sftp_password", sftp_password_);
+          // Set SFTP host paramters and upload file
+          sftp.setHostname(server_);
+          sftp.setUsername(sftp_username_);
+          sftp.setPassword(sftp_password_);
+          sftp.setExpectedServerHash(VI_SSH_HASH);
+
+         if(sftp.uploadFile(localFilename, remoteFilename) && submitJob_())
+         {
+             // Do PREP
+            long timeWait = minutesTimeoutPrep;
+            while((getPrepFileMessage_() == PREP_ANALYZING) && timeWait > 0) {
+                LOG_INFO << "Waiting for PREP analysis to complete, " << intputFilename << ", on SaaS server...Please be patient.";
+                QThread.sleep(minutesCheckPrep * 60000);
+                timeWait -= minutesCheckPrep;
+            }
+            // TODO:  If we timed out, report and error
+         }
       }
       break;
 
@@ -129,26 +142,27 @@ namespace OpenMS
       break;
 
     case FETCH:
-      server_ = experiment_.getMetaValue("veritomyx:server");
-      job_ = experiment_.getMetaValue("veritomyx:job").toQString();
-      sftp_username_ = experiment_.getMetaValue("veritomyx:sftp_username").toQString();
-      sftp_password_ = experiment_.getMetaValue("veritomyx:sftp_password").toQString();
 
+      if(!getSFTPCredentials())
+      {
+          break;
+      }
       if(!checkJob_()) // Seems we need to check STATUS before file is moved to SFTP drop after completion
       {
         break;
       }
 
       // Set SFTP host paramters and upload file
-      sftp.setHostname(server_);
+      sftp.setHostname(sftp_host_);
+      sftp.setPort(sftp_port_);
       sftp.setUsername(sftp_username_);
       sftp.setPassword(sftp_password_);
       sftp.setExpectedServerHash(VI_SSH_HASH);
 
       // Generate local and remote filenames of tar'd scans
-      zipfilename = job_ + ".vcent.tar";
+      sftp_file_ = zipfilename = results_filename_;
       localFilename = QDir::tempPath() + "/" + zipfilename;
-      remoteFilename = "accounts/" + account_number_.toQString() + "/results/" + zipfilename;
+      remoteFilename = sftp_dir_ + "/" + account_number_.toQString() + "/" + zipfilename;
 
       if (!sftp.downloadFile(remoteFilename, localFilename))
       {
@@ -176,9 +190,6 @@ namespace OpenMS
         experiment_[i].setType(SpectrumSettings::PEAKS);
       }
 
-      // remove SFTP username/password from file
-      experiment_.removeMetaValue("veritomyx:sftp_username");
-      experiment_.removeMetaValue("veritomyx:sftp_password");
       removeJob_();
       break;
 
@@ -212,16 +223,19 @@ namespace OpenMS
     LOG_DEBUG << "Requsting credentials for " + username_ + "..." << endl;
 
     url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-    url_.addQueryItem("Version", "1.25");
-    url_.addQueryItem("User", username_.toQString());
-    url_.addQueryItem("Code", password_.toQString());
-    url_.addQueryItem("Action", "INIT");
-    url_.addQueryItem("Account", account_number_.toQString());
-    url_.addQueryItem("Command", "ckm");
-    url_.addQueryItem("Count", QString::number(experiment_.size()));
+
+    QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+    params += "&User="	+ username_.toQString() +
+            "&Code="    + password_.toQString() +
+            "&Action="  + "INIT" +
+            "&ID=" + account_number_.toQString() +
+            "&ScanCount=" + experiment_.size() +
+//		",\"CalibrationCount\": " + calibrationCount + "\"" +
+            "&MinMass=" + minMass +
+            "&MaxMass=" + maxMass;
 
     QNetworkRequest request(url_);
-    reply_ = manager_.get(request);
+    reply_ = manager_.put(request, params.toUtf8());
 
     QEventLoop loop;
     QObject::connect(reply_, SIGNAL(finished()), &loop, SLOT(quit()));
@@ -238,22 +252,36 @@ namespace OpenMS
     QString contents(reply_->readAll());
     reply_->deleteLater();
 
-    if (contents.startsWith("Error"))
+    QJson::Parser parser;
+    bool ok;
+
+    QVariantMap jMap = parser.parse(contents, &ok).toMap();
+    if(!ok) {
+        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        return false;
+    }
+
+    if (jMap.contains("Error"))
     {
-      QStringList list = contents.split(":");
-      LOG_ERROR << "Error occurred:" << list[1].toAscii().data() << endl;
+      LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
       return false;
     }
-    else if (contents.startsWith("<!DOCTYPE HTML"))
+    else if (contents.startsWith("<html><head>"))
     {
       LOG_ERROR << "There is a problem with the specified server address." << endl;
       return false;
     }
 
-    QStringList list = contents.split(" ");
-    job_ = list[2];
-    sftp_username_ = list[3];
-    sftp_password_ = list[4];
+    job_ = jMap["Job"];
+    funds_ = jMap["Funds"];
+    PI_versions_.clear();
+    foreach(QVariant pi, jMap["PI_Versions"].toList()) {
+        PI_versions_.add(pi.toString());
+    }
+    RTOs_.clear();
+    foreach(QVariant rto, jMap["RTOs"].toList()) {
+        PI_versions_.add(rto.toMap());
+    }
 
     return true;
   }
@@ -261,33 +289,59 @@ namespace OpenMS
   bool PeakInvestigator::submitJob_()
   {
     url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-    url_.addQueryItem("Version", "1.25");
-    url_.addQueryItem("User", username_.toQString());
-    url_.addQueryItem("Code", password_.toQString());
-    url_.addQueryItem("Action", "RUN");
-    url_.addQueryItem("Job", job_);
+    QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+    params += "&User="	+ username_.toQString() +
+            "&Code="    + password_.toQString() +
+            "&Action="  + "RUN" +
+            "&Job" + job_ +
+            "&InputFile=" + sftp_file_ +
+            "&RTO=" + RTO_ +
+            "&PIVersion=" + PIversion_;
 
     QNetworkRequest request(url_);
-    reply_ = manager_.get(request);
+    reply_ = manager_.put(request, params.toUtf8());
 
     QEventLoop loop;
     QObject::connect(reply_, SIGNAL(finished()), &loop, SLOT(quit()));
     loop.exec();
 
-    if (reply_->error() != QNetworkReply::NoError)
+    if(!ok) {
+        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        return false;
+    }
+
+    if (jMap.contains("Error"))
     {
-      LOG_ERROR << "There was an error making a network request:\n";
-      LOG_ERROR << reply_->errorString().toAscii().data() << endl;
-      reply_->deleteLater();
+      LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
+      return false;
+    }
+    else if (contents.startsWith("<html><head>"))
+    {
+      LOG_ERROR << "There is a problem with the specified server address." << endl;
       return false;
     }
 
     QString contents(reply_->readAll());
     reply_->deleteLater();
 
-    if (contents.startsWith("Error")) {
-      QStringList list = contents.split(":");
-      cout << "Error occurred:" << list[1].toAscii().data() << endl;
+    QJson::Parser parser;
+    bool ok;
+
+    QVariantMap jMap = parser.parse(contents, &ok).toMap();
+
+    if(!ok) {
+        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        return false;
+    }
+
+    if (jMap.contains("Error"))
+    {
+      LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
+      return false;
+    }
+    else if (contents.startsWith("<html><head>"))
+    {
+      LOG_ERROR << "There is a problem with the specified server address." << endl;
       return false;
     }
 
@@ -310,14 +364,14 @@ namespace OpenMS
     }
 
     url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-    url_.addQueryItem("Version", "1.25");
-    url_.addQueryItem("User", username_.toQString());
-    url_.addQueryItem("Code", password_.toQString());
-    url_.addQueryItem("Action", "STATUS");
-    url_.addQueryItem("Job", job_);
+    QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+    params += "&User="	+ username_.toQString() +
+              "&Code="    + password_.toQString() +
+              "&Action="  + "STATUS" +
+              "&Job" + job_ ;
 
     QNetworkRequest request(url_);
-    reply_ = manager_.get(request);
+    reply_ = manager_.put(request, params.toUtf8());
 
     QEventLoop loop;
     QObject::connect(reply_, SIGNAL(finished()), &loop, SLOT(quit()));
@@ -334,20 +388,39 @@ namespace OpenMS
     QString contents(reply_->readAll());
     reply_->deleteLater();
 
-    if (contents.startsWith("Error"))
-    {
-      QStringList list = contents.split(":");
-      cout << "Error occurred:" << list[1].toAscii().data() << endl;
-      retval = false;
+    QJson::Parser parser;
+    bool ok;
+
+    QVariantMap jMap = parser.parse(contents, &ok).toMap();
+
+    if(!ok) {
+        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        return false;
     }
-    else if (contents.startsWith("Running"))
+
+    if (jMap.contains("Error"))
+    {
+      LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
+      return false;
+    }
+    else if (contents.startsWith("<html><head>"))
+    {
+      LOG_ERROR << "There is a problem with the specified server address." << endl;
+      return false;
+    }
+    else if (jMap["Status"] == "Running")
     {
       LOG_INFO << job_.toAscii().data() << " is still running.\n";
+      date_updated_ = jMap["Datetime"].toDate();
       retval = false;
     }
-    else if (contents.startsWith("Done"))
+    else if (jMap["Status"] == "Done")
     {
       LOG_INFO << job_.toAscii().data() << " has finished.\n";
+      results_file_ = jMap["ResultsFile"].toString();
+      log_file_ = jMap["JobLogFile"].toString();
+      acutal_cost_ = jMap["ActualCost"].toString();
+      date_updated_ = jMap["Datetime"].toDate();
       retval = true;
     }
 
@@ -357,14 +430,14 @@ namespace OpenMS
   bool PeakInvestigator::removeJob_()
   {
     url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-    url_.addQueryItem("Version", "1.25");
-    url_.addQueryItem("User", username_.toQString());
-    url_.addQueryItem("Code", password_.toQString());
-    url_.addQueryItem("Action", "DONE");
-    url_.addQueryItem("Job", job_);
+    QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+    params += "&User="	+ username_.toQString() +
+              "&Code="    + password_.toQString() +
+              "&Action="  + "DELETE" +
+              "&Job" + job_ ;
 
     QNetworkRequest request(url_);
-    reply_ = manager_.get(request);
+    reply_ = manager_.put(request, params.toUtf8());
 
     QEventLoop loop;
     QObject::connect(reply_, SIGNAL(finished()), &loop, SLOT(quit()));
@@ -381,15 +454,158 @@ namespace OpenMS
     QString contents(reply_->readAll());
     reply_->deleteLater();
 
-    if (contents.startsWith("Error")) {
-      QStringList list = contents.split(":");
-      cout << "Error occurred:" << list[1].toAscii().data() << endl;
+    QJson::Parser parser;
+    bool ok;
+
+    QVariantMap jMap = parser.parse(contents, &ok).toMap();
+
+    if(!ok) {
+        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        return false;
+    }
+
+    if (jMap.contains("Error"))
+    {
+      LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
+      return false;
+    }
+    else if (contents.startsWith("<html><head>"))
+    {
+      LOG_ERROR << "There is a problem with the specified server address." << endl;
       return false;
     }
 
     cout << contents.toAscii().data() << endl;
     return true;
 
+  }
+
+  bool getSFTPCredentials()
+  {
+      url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
+      QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+      params += "&User="	+ username_.toQString() +
+                "&Code="    + password_.toQString() +
+                "&Action="  + "SFTP" +
+                "&ID" + account_number_ ;
+
+      QNetworkRequest request(url_);
+      reply_ = manager_.put(request, params.toUtf8());
+
+      QEventLoop loop;
+      QObject::connect(reply_, SIGNAL(finished()), &loop, SLOT(quit()));
+      loop.exec();
+
+      if (reply_->error() != QNetworkReply::NoError)
+      {
+        LOG_ERROR << "There was an error making a network request:\n";
+        LOG_ERROR << reply_->errorString().toAscii().data() << endl;
+        reply_->deleteLater();
+        return false;
+      }
+
+      QString contents(reply_->readAll());
+      reply_->deleteLater();
+
+      QJson::Parser parser;
+      bool ok;
+
+      QVariantMap jMap = parser.parse(contents, &ok).toMap();
+
+      if(!ok) {
+          LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+          return false;
+      }
+
+      if (jMap.contains("Error"))
+      {
+        LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
+        return false;
+      }
+      else if (contents.startsWith("<html><head>"))
+      {
+        LOG_ERROR << "There is a problem with the specified server address." << endl;
+        return false;
+      }
+
+      sftp_host_ = jMap["Host"];
+      sftp_port_ = jMap["Port"];
+      sftp_dir_  = jMap["Directory"];
+      sftp_username = jMap["Login"];
+      sftp_password = jMap["Password"];
+
+      cout << contents.toAscii().data() << endl;
+      return true;
+  }
+
+  PIStatus getPrepFileMessage_()
+  {
+      url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
+      QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+      params += "&User="	+ username_.toQString() +
+                "&Code="    + password_.toQString() +
+                "&Action="  + "PREP" +
+                "&ID" + account_number_ +
+                "&File" + sftp_file_;
+
+      QNetworkRequest request(url_);
+      reply_ = manager_.put(request, params.toUtf8());
+
+      QEventLoop loop;
+      QObject::connect(reply_, SIGNAL(finished()), &loop, SLOT(quit()));
+      loop.exec();
+
+      if (reply_->error() != QNetworkReply::NoError)
+      {
+        LOG_ERROR << "There was an error making a network request:\n";
+        LOG_ERROR << reply_->errorString().toAscii().data() << endl;
+        reply_->deleteLater();
+        return false;
+      }
+
+      QString contents(reply_->readAll());
+      reply_->deleteLater();
+
+      QJson::Parser parser;
+      bool ok;
+
+      QVariantMap jMap = parser.parse(contents, &ok).toMap();
+
+      if(!ok) {
+          LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+          return false;
+      }
+
+      if (jMap.contains("Error"))
+      {
+        LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
+        return false;
+      }
+      else if (contents.startsWith("<html><head>"))
+      {
+        LOG_ERROR << "There is a problem with the specified server address." << endl;
+        return false;
+      }
+
+      QString status = jMap["Status"];
+
+      if(status.equals("Ready"))
+      {
+          prep_count_ = jMap["ScanCount"];
+          // TODO check ScanCount vs count saved, report error if not equal.
+          prep_MStype_ = jMap["MSType"];
+      }
+      else if(status.equals("Analyzing"))
+      {
+          return PREP_ANALYZING;
+      }
+      else
+      {
+          return PREP_ERROR;
+      }
+
+      cout << contents.toAscii().data() << endl;
+      return PREP_READY;
   }
 
   void PeakInvestigator::updateMembers_()

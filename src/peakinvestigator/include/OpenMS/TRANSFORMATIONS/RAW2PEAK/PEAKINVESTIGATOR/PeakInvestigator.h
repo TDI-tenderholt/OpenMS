@@ -93,6 +93,10 @@ namespace OpenMS
     {
         pp.setMode(PeakInvestigator::FETCH);
     }
+    else if(mode == "delete")
+    {
+        pp.setMode(PeakInvestigator::DELETE);
+    }
 
 
     QObject::connect(&pp, SIGNAL(finishedRequest()), &app, SLOT(quit()));
@@ -124,7 +128,13 @@ public:
     {
         SUBMIT,
         CHECK,
-        FETCH
+        FETCH,
+        DELETE
+    };
+
+    enum PIStatus
+    {
+        PREP_ANALYZING, PREP_READY, PREP_ERROR
     };
 
     /// Constructor
@@ -133,8 +143,11 @@ public:
     /// Destructor
     virtual ~PeakInvestigator();
     
-    /// Set the mode to one of the following: SUBMIT, CHECK, FETCH
+    /// Set the mode to one of the following: SUBMIT, CHECK, FETCH, DELETE
     void setMode(PIMode mode) { mode_ = mode; }
+
+    /// Get the status state
+    PIStatus status() {return status_ ; }
 
     /** @brief Set the experiment for processing
      *
@@ -210,6 +223,24 @@ protected:
      */
     bool removeJob_();
 
+    /** @brief Get the SFTP credentials and settings using the <a href="https://secure.veritomyx.com/interface/API.php">
+     * PeakInvestigator API</a>.
+     *
+     * This gets the SFTP credentials and seetings from Veritomyx's servers.
+     * It assumes that the Veritomyx username, password, and account variables have been correctly
+     * specified with setParameters().
+     */
+    bool getSFTPCredentials_();
+
+    /** @brief Run the PREP analysis using the <a href="https://secure.veritomyx.com/interface/API.php">
+     * PeakInvestigator API</a>.
+     *
+     * This runs the PREP activity from Veritomyx's servers and waits for a Ready status.
+     * It assumes that the Veritomyx username, password, and account variables have been correctly
+     * specified with setParameters().
+     */
+    PIStatus getPrepFileMessage_();
+
 ///@}
 //--------------------------------------------------------------------------------------------------------
 
@@ -220,8 +251,23 @@ protected:
     String password_; ///< @brief Veritomyx account password. Should be provided using the TOPP interface.
     String account_number_; ///< @brief Veritomyx account number. Should be provided using the TOPP interface.
     QString job_; ///< @brief Job number obtained from public API during INIT request.
+    QString funds_; ///< @brief Funds obtained from public API during INIT request.
+    QStringList PI_versions_; ///< @brief List of PI versions available obtained from public API during INIT request.
+    QArray<QVariantMap> RTOs_; ///< @brief List of RTOs available obtained from public API during INIT request. (one must be selected)
+    QString PIVersion_; ///< @brief PI version selected by the user.
+    QString RTO_; ///< @brief RTO selected by the user.
     QString sftp_username_; ///< @brief Username for Veritomyx SFTP server, obtained from public API.
     QString sftp_password_; ///< @brief Password for Veritomyx SFTP server, obtained from public API.
+    QString sftp_host_; ///< @brief host name for Veritomyx SFTP server, obtained from public API.
+    int     sftp_port_; /// < @brief host port ID for Veritomyx SFTP server, obtained from public API.
+    QString sftp_file_; /// < @brief Filename for Veritomyx SFTP server. Set from the job ID.
+    QString sftp_dir_; ///< @brief host directory for Veritomyx SFTP server, obtained from public API.
+    int     prep_count_;///< @brief Scans counted by PREPP on Veritomyx SFTP server, obtained from public API.
+    QString prep_ms_type;
+    QString results_file_; ///< @brief results filename from Veritomyx SFTP server, obtained from public API.
+    QString log_file_; ///< @brief Log filename from Veritomyx SFTP server, obtained from public API.
+    QString actual_cost_; ///< @brief Job run cost from Veritomyx SFTP server, obtained from public API.
+    QDate   date_updated_; ///< @brief Date/Time of last update from Veritomyx SFTP server, obtained from public API.
 
     // docu in base class
     void updateMembers_();
@@ -242,6 +288,9 @@ protected:
     // Misc variables
     MSExperiment<Peak1D> experiment_; ///< @brief Class used to hold spectra (raw or peak data) in memory.
     PIMode mode_;
+    PIStatus status_;
+    int prep_scan_count;
+    QString prep_ms_type;
 
   }; // end PeakInvestigator
 
