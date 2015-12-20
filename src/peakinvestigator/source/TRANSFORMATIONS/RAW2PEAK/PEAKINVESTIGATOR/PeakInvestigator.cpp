@@ -56,7 +56,7 @@
 #include <QJson>
 
 #define VI_API_SUFFIX "/api/"
-#define VI_SSH_HASH String("7E:6D:03:89:68:38:0B:9F:C7:E5:13:26:56:46:08:FF")
+#define VI_SSH_HASH String("Hash seed!")
 #define reqVeritomyxCLIVersion "2.12"
 #define minutesCheckPrep 2
 #define minutesTimeoutPrep 20
@@ -75,6 +75,11 @@ namespace OpenMS
     defaults_.setValue("username", "USERNAME", "Username for account registered with Veritomyx");
     defaults_.setValue("password", "PASSWORD", "Password for account registered with Veritomyx");
     defaults_.setValue("account", "0", "Account number");
+
+#ifndef WITH_GUI
+    defaults_.setValue("RTO", "RTO-24", "Response Time Objective to use");
+    defaults_.setValue("PIVersion", "1.0.1", "Version of Peak Investigator to use");
+#endif
 
     // write defaults into Param object param_
     defaultsToParam_();
@@ -182,6 +187,10 @@ namespace OpenMS
       dp.setMetaValue("paramter: veritomyx:username", username_);
       dp.setMetaValue("parameter: veritomyx:account", account_number_);
       dp.setMetaValue("veritomyx:job", job_);
+#ifndef WITH_GUI
+      dp.setMetaValue("veritomyx:RTO", RTO_);
+      dp.setMetaValue("veritomyx:PIVersion", PIVersion_);
+#endif
 
       // Now add meta data to the scans
       for (Size i = 0; i < experiment_.size(); i++)
@@ -274,14 +283,38 @@ namespace OpenMS
 
     job_ = jMap["Job"];
     funds_ = jMap["Funds"];
+ #ifdef WITH_GUI
     PI_versions_.clear();
     foreach(QVariant pi, jMap["PI_Versions"].toList()) {
         PI_versions_.add(pi.toString());
     }
+    PIVersion_ = PI_versions[0];
     RTOs_.clear();
     foreach(QVariant rto, jMap["RTOs"].toList()) {
-        PI_versions_.add(rto.toMap());
+        RTOs_.add(rto.toMap());
     }
+    RTO_ = RTOs_[0];
+
+    // Ask the user what RTO and Version they want to use.
+
+    #include "peakinvestigatorinitdialog.h"
+    // First build the string list for the RTOs.
+    QStringList l;
+    foreach(QVariant i, RTOs_) {
+        l.add(i["RTO"].toString() + ", Estimated Cost: " + i["EstCost"].toString() );
+    }
+
+    PeakInvestigatorInitDialog PIDlg(PI_versions_, l);
+    if(PIDlg.exec() == QDialog::Rejected) {
+        return false;
+    }
+    RTO_ = PIDlg.getRTO();
+    PIVersion_ = PIDlg.getVersion();
+
+#else
+    RTO_ = experiment_.getMetaValue("veritomyx:RTO").toQString();
+    PIVersion_ = experiment_.getMetaValue("veritomyx:PIVersion").toQString();
+#endif
 
     return true;
   }
