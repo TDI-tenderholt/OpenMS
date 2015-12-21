@@ -308,7 +308,7 @@ namespace OpenMS
     if(PIDlg.exec() == QDialog::Rejected) {
         return false;
     }
-    RTO_ = PIDlg.getRTO();
+    RTO_ = PIDlg.getRTO().split(",")[0];
     PIVersion_ = PIDlg.getVersion();
 
 #else
