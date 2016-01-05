@@ -51,13 +51,27 @@
 #include <QtCore/QStringList>
 #include <QtCore/QTextStream>
 #include <QtCore/QtDebug>
+#include <QtCore/QThread>
+#include <QtCore/qglobal.h>
 
 // JSON support
-#include <QJson>
+#include <qjson/parser.h>
+#ifdef WITH_GUI
+#include <QtGui/QDialog>
+#include <QtGui/QInputDialog>
+#include <QtGui/QComboBox>
+#include <QtGui/QLineEdit>
+#include <QtGui/QLabel>
+#include <QtGui/QFormLayout>
+#include <QtGui/QVBoxLayout>
+#include <QtGui/QHBoxLayout>
+#include <QtGui/QPushButton>
+#include <QtGui/QFrame>
+#endif
 
 #define VI_API_SUFFIX "/api/"
 #define VI_SSH_HASH String("Hash seed!")
-#define reqVeritomyxCLIVersion "2.12"
+#define reqVeritomyxCLIVersion String("2.12")
 #define minutesCheckPrep 2
 #define minutesTimeoutPrep 20
 
@@ -75,6 +89,9 @@ namespace OpenMS
     defaults_.setValue("username", "USERNAME", "Username for account registered with Veritomyx");
     defaults_.setValue("password", "PASSWORD", "Password for account registered with Veritomyx");
     defaults_.setValue("account", "0", "Account number");
+
+    defaults_.setValue("MinMass", "0", "Minimum mass to use");
+    defaults_.setValue("MaxMass", QString::number(2^32), "Maximum mass to use");
 
 #ifndef WITH_GUI
     defaults_.setValue("RTO", "RTO-24", "Response Time Objective to use");
@@ -96,8 +113,8 @@ namespace OpenMS
 
     // filenames for the tar'd scans/results
     QString zipfilename;
-    QString localFilename;
-    QString remoteFilename;
+    String localFilename;
+    String remoteFilename;
 
     switch(mode_)
     {
@@ -120,7 +137,7 @@ namespace OpenMS
         experiment_[i].clear(false);
       }
 
-      if(getSFTPCredentials()) {
+      if(getSFTPCredentials_()) {
 
           // Set SFTP host paramters and upload file
           sftp.setHostname(server_);
@@ -133,8 +150,8 @@ namespace OpenMS
              // Do PREP
             long timeWait = minutesTimeoutPrep;
             while((getPrepFileMessage_() == PREP_ANALYZING) && timeWait > 0) {
-                LOG_INFO << "Waiting for PREP analysis to complete, " << intputFilename << ", on SaaS server...Please be patient.";
-                QThread.sleep(minutesCheckPrep * 60000);
+                LOG_INFO << "Waiting for PREP analysis to complete, " << localFilename << ", on SaaS server...Please be patient.";
+                QThread::currentThread()->wait(minutesCheckPrep * 60000);
                 timeWait -= minutesCheckPrep;
             }
             // TODO:  If we timed out, report and error
@@ -146,9 +163,13 @@ namespace OpenMS
       checkJob_();
       break;
 
+    case DELETE:
+      removeJob_();
+      break;
+
     case FETCH:
 
-      if(!getSFTPCredentials())
+      if(!getSFTPCredentials_())
       {
           break;
       }
@@ -159,13 +180,13 @@ namespace OpenMS
 
       // Set SFTP host paramters and upload file
       sftp.setHostname(sftp_host_);
-      sftp.setPort(sftp_port_);
+      sftp.setPortnumber(sftp_port_);
       sftp.setUsername(sftp_username_);
       sftp.setPassword(sftp_password_);
       sftp.setExpectedServerHash(VI_SSH_HASH);
 
       // Generate local and remote filenames of tar'd scans
-      sftp_file_ = zipfilename = results_filename_;
+      sftp_file_ = zipfilename = results_file_;
       localFilename = QDir::tempPath() + "/" + zipfilename;
       remoteFilename = sftp_dir_ + "/" + account_number_.toQString() + "/" + zipfilename;
 
@@ -177,19 +198,20 @@ namespace OpenMS
       tar.load(localFilename, experiment_);
 
       // Set-up data processing meta data to add to each scan
-      DataProcessing dp;
+      boost::shared_ptr<DataProcessing> dp(new DataProcessing());
       std::set<DataProcessing::ProcessingAction> actions;
       actions.insert(DataProcessing::PEAK_PICKING);
-      dp.setProcessingActions(actions);
-      dp.getSoftware().setName("PeakInvestigator");
-      dp.setCompletionTime(DateTime::now());
-      dp.setMetaValue("paramter: veritomyx:server", server_);
-      dp.setMetaValue("paramter: veritomyx:username", username_);
-      dp.setMetaValue("parameter: veritomyx:account", account_number_);
-      dp.setMetaValue("veritomyx:job", job_);
+      dp->setProcessingActions(actions);
+      dp->getSoftware().setName("PeakInvestigator");
+      dp->setCompletionTime(DateTime::now());
+      dp->setMetaValue("paramter: veritomyx:server", server_);
+      dp->setMetaValue("paramter: veritomyx:username", username_);
+      dp->setMetaValue("parameter: veritomyx:account", account_number_);
+      dp->setMetaValue("veritomyx:job", job_);
+
 #ifndef WITH_GUI
-      dp.setMetaValue("veritomyx:RTO", RTO_);
-      dp.setMetaValue("veritomyx:PIVersion", PIVersion_);
+      dp->setMetaValue("veritomyx:RTO", RTO_);
+      dp->setMetaValue("veritomyx:PIVersion", PIVersion_);
 #endif
 
       // Now add meta data to the scans
@@ -200,7 +222,7 @@ namespace OpenMS
       }
 
       removeJob_();
-      break;
+        break;
 
     } //end switch
 
@@ -233,7 +255,58 @@ namespace OpenMS
 
     url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
 
-    QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+    Size minMass = 0, maxMass = 0;
+    for (Size i = 0; i < experiment_.size(); i++)
+    {
+      maxMass = qMax(maxMass, experiment_[i].size());
+    }
+#ifdef WITH_GUI
+// Ask the user for a min and max value
+    QDialog *massDlg = new QDialog();
+    massDlg->setWindowTitle("Peak Investigator Job");
+    QVBoxLayout *mainLayout = new QVBoxLayout(massDlg);
+    QFrame *formFrame = new QFrame(massDlg);
+    QFormLayout *form = new QFormLayout(formFrame);
+    QLabel *maxLabel = new QLabel("Maximum Mass:", massDlg);
+    QLabel *minLabel = new QLabel("Minimum Mass:", massDlg);
+    QLineEdit *maxEdit = new QLineEdit(QString::number(maxMass), massDlg);
+    QLineEdit *minEdit = new QLineEdit(QString::number(minMass), massDlg);
+    form->addRow(maxLabel, maxEdit);
+    form->addRow(minLabel, minEdit);
+    mainLayout->addWidget(formFrame);
+    QFrame *btnFrame = new QFrame(massDlg);
+    QPushButton *okBtn = new QPushButton("Accept", massDlg);
+    QObject::connect(okBtn, SIGNAL(clicked()), massDlg, SIGNAL(accept()));
+    QPushButton *rejectBtn = new QPushButton("Reject", massDlg);
+    QObject::connect(rejectBtn, SIGNAL(clicked()), massDlg, SIGNAL(reject()));
+    QHBoxLayout *buttonLayout = new QHBoxLayout(btnFrame);
+    buttonLayout->addWidget(okBtn);
+    buttonLayout->addWidget(rejectBtn);
+    mainLayout->addWidget(btnFrame);
+    if(massDlg->exec() == QDialog::Accepted) {
+        uint xmass = maxEdit->text().toUInt();
+        if(xmass > maxMass) {
+            LOG_ERROR << "The Maximum Mass must be less than " <<  maxMass;
+            return false;
+        } else {
+            maxMass = xmass;
+        }
+        xmass = minEdit->text().toUInt();
+        if(xmass > maxMass) {
+            LOG_ERROR << "The Minimum Mass must be less than the Maximum Mass";
+            return false;
+        } else {
+            minMass = xmass;
+        }
+    } else {
+        return false;
+    }
+#else
+    dp.getMetaValue("veritomyx:MinMass", minMass);
+    dp.getMetaValue("veritomyx:MaxMass", maxMass);
+#endif
+
+    QString params = QString("Version=" + reqVeritomyxCLIVersion.toQString()); // online CLI version that matches this interface
     params += "&User="	+ username_.toQString() +
             "&Code="    + password_.toQString() +
             "&Action="  + "INIT" +
@@ -264,9 +337,9 @@ namespace OpenMS
     QJson::Parser parser;
     bool ok;
 
-    QVariantMap jMap = parser.parse(contents, &ok).toMap();
+    QVariantMap jMap = parser.parse(contents.toAscii(), &ok).toMap();
     if(!ok) {
-        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents.toAscii().data() << endl;
         return false;
     }
 
@@ -281,35 +354,32 @@ namespace OpenMS
       return false;
     }
 
-    job_ = jMap["Job"];
-    funds_ = jMap["Funds"];
+    job_ = jMap["Job"].toString();
+    funds_ = jMap["Funds"].toString();
  #ifdef WITH_GUI
     PI_versions_.clear();
     foreach(QVariant pi, jMap["PI_Versions"].toList()) {
-        PI_versions_.add(pi.toString());
+        PI_versions_ << pi.toString();
     }
-    PIVersion_ = PI_versions[0];
+    PIVersion_ = PI_versions_[0];
     RTOs_.clear();
     foreach(QVariant rto, jMap["RTOs"].toList()) {
-        RTOs_.add(rto.toMap());
+        RTOs_ << rto.toMap();
     }
-    RTO_ = RTOs_[0];
+    RTO_ = RTOs_[0]["RTO"].toString() ;
 
     // Ask the user what RTO and Version they want to use.
 
-    #include "peakinvestigatorinitdialog.h"
     // First build the string list for the RTOs.
     QStringList l;
-    foreach(QVariant i, RTOs_) {
-        l.add(i["RTO"].toString() + ", Estimated Cost: " + i["EstCost"].toString() );
+    foreach(QVariantMap i, RTOs_) {
+        l << i["RTO"].toString() + ", Estimated Cost: " + i["EstCost"].toString();
     }
 
-    PeakInvestigatorInitDialog PIDlg(PI_versions_, l);
-    if(PIDlg.exec() == QDialog::Rejected) {
-        return false;
-    }
-    RTO_ = PIDlg.getRTO().split(",")[0];
-    PIVersion_ = PIDlg.getVersion();
+    PIVersion_ = QInputDialog::getItem(NULL, "Peak Investigator", "Please select which version you wish to use.", PI_versions_);
+
+    QString ret = QInputDialog::getItem(NULL, "Peak Investigator", "Please select which RTO you wish to use.\nYou have available funds of " + funds_, l);
+    RTO_ = ret.split(",")[0];
 
 #else
     RTO_ = experiment_.getMetaValue("veritomyx:RTO").toQString();
@@ -322,14 +392,14 @@ namespace OpenMS
   bool PeakInvestigator::submitJob_()
   {
     url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-    QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+    QString params = QString("Version=") + reqVeritomyxCLIVersion.toQString(); // online CLI version that matches this interface
     params += "&User="	+ username_.toQString() +
             "&Code="    + password_.toQString() +
             "&Action="  + "RUN" +
             "&Job" + job_ +
             "&InputFile=" + sftp_file_ +
             "&RTO=" + RTO_ +
-            "&PIVersion=" + PIversion_;
+            "&PIVersion=" + PIVersion_;
 
     QNetworkRequest request(url_);
     reply_ = manager_.put(request, params.toUtf8());
@@ -338,32 +408,16 @@ namespace OpenMS
     QObject::connect(reply_, SIGNAL(finished()), &loop, SLOT(quit()));
     loop.exec();
 
-    if(!ok) {
-        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
-        return false;
-    }
-
-    if (jMap.contains("Error"))
-    {
-      LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
-      return false;
-    }
-    else if (contents.startsWith("<html><head>"))
-    {
-      LOG_ERROR << "There is a problem with the specified server address." << endl;
-      return false;
-    }
-
     QString contents(reply_->readAll());
     reply_->deleteLater();
 
     QJson::Parser parser;
     bool ok;
 
-    QVariantMap jMap = parser.parse(contents, &ok).toMap();
+    QVariantMap jMap = parser.parse(contents.toAscii(), &ok).toMap();
 
     if(!ok) {
-        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        LOG_ERROR << "Error parsing JSON return from RUN occurred:" << contents.toAscii().data() << endl;
         return false;
     }
 
@@ -397,7 +451,7 @@ namespace OpenMS
     }
 
     url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-    QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+    QString params = QString("Version=") + reqVeritomyxCLIVersion.toQString(); // online CLI version that matches this interface
     params += "&User="	+ username_.toQString() +
               "&Code="    + password_.toQString() +
               "&Action="  + "STATUS" +
@@ -424,10 +478,10 @@ namespace OpenMS
     QJson::Parser parser;
     bool ok;
 
-    QVariantMap jMap = parser.parse(contents, &ok).toMap();
+    QVariantMap jMap = parser.parse(contents.toAscii(), &ok).toMap();
 
     if(!ok) {
-        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents.toAscii().data() << endl;
         return false;
     }
 
@@ -452,7 +506,7 @@ namespace OpenMS
       LOG_INFO << job_.toAscii().data() << " has finished.\n";
       results_file_ = jMap["ResultsFile"].toString();
       log_file_ = jMap["JobLogFile"].toString();
-      acutal_cost_ = jMap["ActualCost"].toString();
+      actual_cost_ = jMap["ActualCost"].toString();
       date_updated_ = jMap["Datetime"].toDate();
       retval = true;
     }
@@ -463,7 +517,7 @@ namespace OpenMS
   bool PeakInvestigator::removeJob_()
   {
     url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-    QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+    QString params = QString("Version=") + reqVeritomyxCLIVersion.toQString(); // online CLI version that matches this interface
     params += "&User="	+ username_.toQString() +
               "&Code="    + password_.toQString() +
               "&Action="  + "DELETE" +
@@ -490,10 +544,10 @@ namespace OpenMS
     QJson::Parser parser;
     bool ok;
 
-    QVariantMap jMap = parser.parse(contents, &ok).toMap();
+    QVariantMap jMap = parser.parse(contents.toAscii(), &ok).toMap();
 
     if(!ok) {
-        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+        LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents.toAscii().data() << endl;
         return false;
     }
 
@@ -513,14 +567,14 @@ namespace OpenMS
 
   }
 
-  bool getSFTPCredentials()
+  bool PeakInvestigator::getSFTPCredentials_()
   {
       url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-      QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+      QString params = QString("Version=") + reqVeritomyxCLIVersion.toQString(); // online CLI version that matches this interface
       params += "&User="	+ username_.toQString() +
                 "&Code="    + password_.toQString() +
                 "&Action="  + "SFTP" +
-                "&ID" + account_number_ ;
+                "&ID" + account_number_.toQString() ;
 
       QNetworkRequest request(url_);
       reply_ = manager_.put(request, params.toUtf8());
@@ -543,10 +597,10 @@ namespace OpenMS
       QJson::Parser parser;
       bool ok;
 
-      QVariantMap jMap = parser.parse(contents, &ok).toMap();
+      QVariantMap jMap = parser.parse(contents.toAscii(), &ok).toMap();
 
       if(!ok) {
-          LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
+          LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents.toAscii().data() << endl;
           return false;
       }
 
@@ -561,24 +615,24 @@ namespace OpenMS
         return false;
       }
 
-      sftp_host_ = jMap["Host"];
-      sftp_port_ = jMap["Port"];
-      sftp_dir_  = jMap["Directory"];
-      sftp_username = jMap["Login"];
-      sftp_password = jMap["Password"];
+      sftp_host_ = jMap["Host"].toString();
+      sftp_port_ = jMap["Port"].toString().toInt();
+      sftp_dir_  = jMap["Directory"].toString();
+      sftp_username_ = jMap["Login"].toString();
+      sftp_password_ = jMap["Password"].toString();
 
       cout << contents.toAscii().data() << endl;
       return true;
   }
 
-  PIStatus getPrepFileMessage_()
+  PeakInvestigator::PIStatus PeakInvestigator::getPrepFileMessage_()
   {
       url_.setUrl("https://" + server_.toQString() + VI_API_SUFFIX);
-      QString params = QString("Version=" + reqVeritomyxCLIVersion); // online CLI version that matches this interface
+      QString params = QString("Version=") + reqVeritomyxCLIVersion.toQString(); // online CLI version that matches this interface
       params += "&User="	+ username_.toQString() +
                 "&Code="    + password_.toQString() +
                 "&Action="  + "PREP" +
-                "&ID" + account_number_ +
+                "&ID" + account_number_.toQString() +
                 "&File" + sftp_file_;
 
       QNetworkRequest request(url_);
@@ -593,7 +647,7 @@ namespace OpenMS
         LOG_ERROR << "There was an error making a network request:\n";
         LOG_ERROR << reply_->errorString().toAscii().data() << endl;
         reply_->deleteLater();
-        return false;
+        return PREP_ERROR;
       }
 
       QString contents(reply_->readAll());
@@ -602,33 +656,33 @@ namespace OpenMS
       QJson::Parser parser;
       bool ok;
 
-      QVariantMap jMap = parser.parse(contents, &ok).toMap();
+      QVariantMap jMap = parser.parse(contents.toAscii(), &ok).toMap();
 
       if(!ok) {
-          LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents << endl;
-          return false;
+          LOG_ERROR << "Error parsing JSON return from INIT occurred:" << contents.toAscii().data() << endl;
+          return PREP_ERROR;
       }
 
       if (jMap.contains("Error"))
       {
         LOG_ERROR << "Error occurred:" << jMap["Error"].toByteArray().data() << endl;
-        return false;
+        return PREP_ERROR;
       }
       else if (contents.startsWith("<html><head>"))
       {
         LOG_ERROR << "There is a problem with the specified server address." << endl;
-        return false;
+        return PREP_ERROR;
       }
 
-      QString status = jMap["Status"];
+      QString status = jMap["Status"].toString();
 
-      if(status.equals("Ready"))
+      if(status == "Ready")
       {
-          prep_count_ = jMap["ScanCount"];
+          prep_count_ = jMap["ScanCount"].toString().toInt();
           // TODO check ScanCount vs count saved, report error if not equal.
-          prep_MStype_ = jMap["MSType"];
+          prep_ms_type = jMap["MSType"].toString();
       }
-      else if(status.equals("Analyzing"))
+      else if(status == "Analyzing")
       {
           return PREP_ANALYZING;
       }
