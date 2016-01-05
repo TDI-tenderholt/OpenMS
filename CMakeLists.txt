@@ -35,6 +35,8 @@
 cmake_minimum_required(VERSION 2.8.3 FATAL_ERROR)
 project("OpenMS_host")
 
+set(CMAKE_LEGACY_CYGWIN_WIN32 0)
+
 #------------------------------------------------------------------------------
 # General CMake definitions & helper
 #------------------------------------------------------------------------------
@@ -71,6 +73,18 @@ option(BOOST_USE_STATIC "Use Boost static libraries." ON)
 option(HAS_XSERVER "Indicates if an X server is available. If set to Off it will disable certain tests and the doc target." ON)
 option(ENABLE_TUTORIALS "Indicates whether tutorials should be build. Note that this also depends on the availability of (pdf)latex." ON)
 option(WITH_GUI "Build GUI parts of OpenMS (TOPPView&Co). This requires QtGui." ON)
+
+# ---------- Find Boost Headers/Libraries -----------------------
+SET (Boost_FIND_REQUIRED TRUE)
+SET (Boost_FIND_QUIETLY TRUE)
+SET (Boost_DEBUG FALSE)
+set (Boost_USE_MULTITHREADED TRUE)
+set (Boost_USE_STATIC_LIBS TRUE)
+SET (Boost_ADDITIONAL_VERSIONS "1.39" "1.39.0")
+
+FIND_PACKAGE(Boost COMPONENTS  program_options )
+INCLUDE_DIRECTORIES(${Boost_INCLUDE_DIRS})
+LINK_DIRECTORIES(${Boost_LIBRARY_DIRS})
 
 #------------------------------------------------------------------------------
 # Extend module path with our modules
