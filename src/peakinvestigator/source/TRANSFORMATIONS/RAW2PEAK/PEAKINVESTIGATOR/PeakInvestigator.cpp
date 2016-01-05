@@ -359,7 +359,7 @@ namespace OpenMS
  #ifdef WITH_GUI
     PI_versions_.clear();
     foreach(QVariant pi, jMap["PI_Versions"].toList()) {
-        PI_versions_ << pi.toString();
+        PI_versions_.prepend(pi.toString());
     }
     PIVersion_ = PI_versions_[0];
     RTOs_.clear();
